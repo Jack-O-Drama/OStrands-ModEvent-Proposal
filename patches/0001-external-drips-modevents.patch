@@ -1,0 +1,457 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -22,6 +22,7 @@
+ 	AUTHOR "Saint"
+ 	SOURCES
+ 		src/main.cpp
++		src/ExternalDrips.cpp
+ 		src/Anatomy.cpp
+ 		src/AutoPairs.cpp
+ 		src/Body.cpp
+--- /dev/null
++++ b/src/AmbientLease.h
+@@ -0,0 +1,40 @@
++// EroBooks prototype addition, 2026-10-15. GPL-3.0.
++#pragma once
++#include <algorithm>
++#include <cmath>
++
++namespace OStrands
++{
++    // Elapsed time is unpaused real time, never game hours or the physics clamp.
++    class AmbientLease
++    {
++    public:
++        void Request(float interval)
++        {
++            if (!std::isfinite(interval) || interval <= 0.0f) {
++                Stop();
++                return;
++            }
++            if (!Active()) timer = 0.1f;
++            period = std::clamp(interval, 1.0f, 30.0f);
++            remaining = 8.0f;
++        }
++        void Stop() { remaining = 0.0f; timer = 0.1f; }
++        bool Active() const { return remaining > 0.0f; }
++        bool Advance(float dt, bool eligible)
++        {
++            if (!Active() || !std::isfinite(dt) || dt <= 0.0f) return false;
++            remaining = std::max(0.0f, remaining - dt);
++            if (!Active()) return false;
++            if (!eligible) { timer = 0.1f; return false; }
++            timer -= dt;
++            if (timer > 0.0f) return false;
++            timer = period; // Never burst to catch up after a stall.
++            return true;
++        }
++    private:
++        float remaining{ 0.0f };
++        float timer{ 0.1f };
++        float period{ 4.0f };
++    };
++}
+--- /dev/null
++++ b/src/ExternalDrips.cpp
+@@ -0,0 +1,103 @@
++// EroBooks prototype addition, 2026-10-15. GPL-3.0.
++#include "ExternalDrips.h"
++#include "ExternalDripsProtocol.h"
++#include "StrandManager.h"
++#include <cmath>
++#include <map>
++#include <algorithm>
++#include <utility>
++
++namespace OStrands::ExternalDrips
++{
++    namespace
++    {
++        std::mutex mutex;
++        std::optional<float> pending;
++        bool ping{ false };
++        std::map<std::int32_t, std::vector<RE::ActorHandle>> scenes;
++        std::string state{ "idle" };
++
++        void Reply()
++        {
++            auto* source = SKSE::GetModCallbackEventSource();
++            auto* player = RE::PlayerCharacter::GetSingleton();
++            if (!source || !player) return;
++            SKSE::ModCallbackEvent event{ RE::BSFixedString("EBF_OStrands_Status"),
++                RE::BSFixedString(state), 1.0f, player };
++            source->SendEvent(&event);
++        }
++
++        class Listener : public RE::BSTEventSink<SKSE::ModCallbackEvent>
++        {
++        public:
++            RE::BSEventNotifyControl ProcessEvent(const SKSE::ModCallbackEvent* event,
++                RE::BSTEventSource<SKSE::ModCallbackEvent>*) override
++            {
++                // API v1 deliberately accepts only requests sent by the player.
++                if (!event || event->sender != RE::PlayerCharacter::GetSingleton() ||
++                    !EqualASCII(event->eventName.c_str(), "EBF_OStrands_Request"))
++                    return RE::BSEventNotifyControl::kContinue;
++                const std::string_view command = event->strArg.c_str();
++                std::scoped_lock guard(mutex);
++                if (EqualASCII(command, "ping")) ping = true;
++                else if (EqualASCII(command, "stop")) pending = 0.0f;
++                else if (EqualASCII(command, "start")) {
++                    pending = std::isfinite(event->numArg) && event->numArg > 0.0f ?
++                        std::clamp(event->numArg, 1.0f, 30.0f) : 0.0f;
++                }
++                return RE::BSEventNotifyControl::kContinue;
++            }
++        } listener;
++    }
++    void Connect()
++    {
++        if (auto* source = SKSE::GetModCallbackEventSource()) {
++            source->AddEventSink(&listener);
++            logger::info("EroBooks external drips prototype API v1 registered (player only)");
++        }
++    }
++    void Update()
++    {
++        std::optional<float> request;
++        bool respond;
++        {
++            std::scoped_lock guard(mutex);
++            request.swap(pending);
++            respond = std::exchange(ping, false);
++        }
++        // Scene graph changes occur only here/on the frame thread, not in the event sink.
++        if (request) StrandManager::Get().RequestAmbient(*request);
++        if (respond) Reply();
++    }
++    void Status(const char* value)
++    {
++        if (state == value) return;
++        state = value;
++        Reply();
++    }
++    void Scene(std::int32_t thread, const std::vector<RE::ActorHandle>& actors)
++    {
++        std::scoped_lock guard(mutex);
++        scenes[thread] = actors;
++    }
++    void EndScene(std::int32_t thread)
++    {
++        std::scoped_lock guard(mutex);
++        scenes.erase(thread);
++    }
++    bool InScene(RE::ActorHandle actor)
++    {
++        std::scoped_lock guard(mutex);
++        for (const auto& [id, actors] : scenes)
++            if (std::find(actors.begin(), actors.end(), actor) != actors.end()) return true;
++        return false;
++    }
++    void Reset()
++    {
++        std::scoped_lock guard(mutex);
++        pending.reset();
++        ping = false;
++        scenes.clear();
++        state = "idle";
++    }
++}
+--- /dev/null
++++ b/src/ExternalDrips.h
+@@ -0,0 +1,12 @@
++// EroBooks prototype addition, 2026-10-15. GPL-3.0.
++#pragma once
++namespace OStrands::ExternalDrips
++{
++    void Connect();
++    void Update();
++    void Reset();
++    void Scene(std::int32_t thread, const std::vector<RE::ActorHandle>& actors);
++    void EndScene(std::int32_t thread);
++    bool InScene(RE::ActorHandle actor);
++    void Status(const char* status);
++}
+--- /dev/null
++++ b/src/ExternalDripsProtocol.h
+@@ -0,0 +1,16 @@
++// EroBooks prototype addition, 2026-10-15. GPL-3.0.
++#pragma once
++#include <string_view>
++
++namespace OStrands::ExternalDrips
++{
++    // Papyrus/BSFixedString can retain a different first-seen capitalization.
++    constexpr bool EqualASCII(std::string_view a, std::string_view b)
++    {
++        if (a.size() != b.size()) return false;
++        const auto lower = [](char c) { return c >= 'A' && c <= 'Z' ? char(c + ('a' - 'A')) : c; };
++        for (std::size_t i = 0; i < a.size(); ++i)
++            if (lower(a[i]) != lower(b[i])) return false;
++        return true;
++    }
++}
+--- a/src/FluidManager.cpp
++++ b/src/FluidManager.cpp
+@@ -1,6 +1,7 @@
+ #include "FluidManager.h"
+ 
+ #include "Body.h"
++#include "ExternalDrips.h"
+ #include "Settings.h"
+ #include "fluid/Clusters.h"
+ 
+@@ -238,12 +239,14 @@
+ 
+ 	void FluidManager::EndThread(std::int32_t a_thread)
+ 	{
++		ExternalDrips::EndScene(a_thread);
+ 		std::scoped_lock guard(_lock);
+ 		_pending.push_back({ Event::Type::kEnd, a_thread });
+ 	}
+ 
+ 	void FluidManager::Scene(std::int32_t a_thread, std::vector<RE::ActorHandle> a_actors)
+ 	{
++		ExternalDrips::Scene(a_thread, a_actors);
+ 		std::scoped_lock guard(_lock);
+ 		_pending.push_back({ Event::Type::kScene, a_thread, {}, {}, 0.0f, std::move(a_actors) });
+ 	}
+--- a/src/Hooks.cpp
++++ b/src/Hooks.cpp
+@@ -1,6 +1,7 @@
+ #include "Hooks.h"
+ 
+ #include "Body.h"
++#include "ExternalDrips.h"
+ #include "FluidManager.h"
+ #include "OStimBridge.h"
+ #include "SexLabBridge.h"
+@@ -26,15 +27,18 @@
+ 				if (now - _lastRun < 1ms) {
+ 					return RE::BSEventNotifyControl::kContinue;
+ 				}
++				const float realDelta = _lastRun.time_since_epoch().count() == 0 ? 0.0f :
++					std::chrono::duration<float>(now - _lastRun).count();
+ 				_lastRun = now;
+ 				Heartbeat(now);
++				ExternalDrips::Update();
+ 				if (auto* ui = RE::UI::GetSingleton(); ui && ui->GameIsPaused()) {
+ 					return RE::BSEventNotifyControl::kContinue;
+ 				}
+ 				const float delta = RE::GetSecondsSinceLastFrame();
+ 				Body::BeginFrame(delta);
+ 				SexLabBridge::Update(delta);
+-				StrandManager::Get().Update(delta);
++				StrandManager::Get().Update(delta, realDelta);
+ 				FluidManager::Get().Update(delta);
+ 				CheckTestKey();
+ 				return RE::BSEventNotifyControl::kContinue;
+--- a/src/StrandManager.cpp
++++ b/src/StrandManager.cpp
+@@ -1,6 +1,7 @@
+ #include "StrandManager.h"
+ 
+ #include "Settings.h"
++#include "ExternalDrips.h"
+ 
+ namespace OStrands
+ {
+@@ -160,8 +161,67 @@
+ 		_dirty = true;
+ 	}
+ 
++    // EroBooks prototype additions, 2026-10-15. GPL-3.0.
++    void StrandManager::RequestAmbient(float interval)
++    {
++        _ambient.Request(interval);
++        if (!_ambient.Active()) {
++            _ambientEligible = false;
++            ClearAmbientStrands();
++            ExternalDrips::Status("idle");
++        }
++    }
++
++    void StrandManager::ClearAmbientStrands()
++    {
++        for (auto& strand : _strands)
++            if (strand.active && strand.external) Retire(strand);
++    }
++
++    void StrandManager::TickAmbient(float elapsed)
++    {
++        if (!_ambient.Active()) {
++            if (_ambientEligible) ClearAmbientStrands();
++            _ambientEligible = false;
++            return;
++        }
++        auto* player = RE::PlayerCharacter::GetSingleton();
++        auto* root = player ? player->Get3D(false) : nullptr;
++        const auto& settings = Settings::Get();
++        const char* status = "active";
++        std::vector<Point> points;
++        RE::NiPoint3 center;
++        bool eligible = false;
++        if (!settings.drips) status = "disabled";
++        else if (!player || !root || player->IsDead() || player->IsChild()) status = "body";
++        else if (ExternalDrips::InScene(player->GetHandle()) ||
++            std::ranges::any_of(_pairs, [&](const PairState& state) {
++                return state.pair.giver == player->GetHandle() || state.pair.receiver == player->GetHandle();
++            })) status = "scene";
++        else if (std::ranges::any_of(_lingering, [&](const Linger& state) {
++            return state.actor == player->GetHandle();
++        })) status = "linger";
++        else if (!Anatomy::Collect(root, Anatomy::Names::Get().vaginaRim, points, center)) status = "body";
++        else eligible = true;
++
++        const bool due = _ambient.Advance(elapsed, eligible);
++        if (!_ambient.Active()) { eligible = false; status = "expired"; }
++        _ambientEligible = eligible;
++        if (!eligible) ClearAmbientStrands();
++        if (due) {
++            if (EnsureMesh()) {
++                Pair pair{};
++                pair.receiver = player->GetHandle();
++                SpawnDripAt(pair, Source::kReceiver, root, points, true);
++            } else status = "mesh";
++        }
++        ExternalDrips::Status(status);
++    }
++
+ 	void StrandManager::Reset()
+ 	{
++		_ambient.Stop();
++		_ambientEligible = false;
+ 		{
+ 			std::scoped_lock guard(_lock);
+ 			_threads.clear();
+@@ -362,6 +422,7 @@
+ 			it = std::prev(_strands.end());
+ 		}
+ 		Strand& strand = *it;
++		strand.external = false;
+ 		strand.frames = {};
+ 		strand.previousStep = 0.0f;
+ 		strand.serial = ++_serial;
+@@ -909,7 +970,7 @@
+ 		SpawnDripAt(a_state.pair, a_source, a_source == Source::kGiver ? anchors.giverRoot : anchors.receiverRoot, points);
+ 	}
+ 
+-	void StrandManager::SpawnDripAt(const Pair& a_pair, Source a_source, RE::NiAVObject* a_root, const std::vector<Point>& a_points)
++	void StrandManager::SpawnDripAt(const Pair& a_pair, Source a_source, RE::NiAVObject* a_root, const std::vector<Point>& a_points, bool a_external)
+ 	{
+ 		const auto& settings = Settings::Get();
+ 		if (a_points.empty() || !a_root || Count(a_pair, Kind::kDrip, a_source) >= settings.dripMaxPerSource) {
+@@ -923,6 +984,7 @@
+ 		const RE::NiPoint3 top = point.World();
+ 
+ 		strand->kind = Kind::kDrip;
++		strand->external = a_external;
+ 		strand->source = a_source;
+ 		strand->owner = a_source == Source::kGiver ? a_pair.giver : a_pair.receiver;
+ 		strand->pair = a_pair;
+@@ -1201,11 +1263,14 @@
+ 		a_strand.bottom = End{};
+ 	}
+ 
+-	void StrandManager::Update(float a_delta)
++	void StrandManager::Update(float a_delta, float a_realDelta)
+ 	{
+ 		auto settingsGuard = Settings::Lock();
+ 		const auto& settings = Settings::Get();
+ 		if (!settings.enabled) {
++			_ambient.Stop();
++			_ambientEligible = false;
++			ExternalDrips::Status("disabled");
+ 			for (auto& strand : _strands) {
+ 				if (strand.active) {
+ 					Retire(strand);
+@@ -1223,6 +1288,7 @@
+ 		const auto start = std::chrono::steady_clock::now();
+ 
+ 		ApplyPendingPairs();
++		TickAmbient(a_realDelta);
+ 		const bool anyActive = std::ranges::any_of(_strands, [](const Strand& s) { return s.active; }) ||
+ 		                       std::ranges::any_of(_glints, [](const Glint& g) { return g.active; });
+ 		if (_pairs.empty() && _lingering.empty() && !anyActive) {
+@@ -1287,7 +1353,7 @@
+ 				const bool lingering = std::ranges::any_of(_lingering, [&](const Linger& a_linger) {
+ 					return a_linger.pair == strand.pair && a_linger.source == strand.source;
+ 				});
+-				if (pair == _pairs.end() && !lingering) {
++				if (pair == _pairs.end() && !lingering && !(strand.external && _ambientEligible)) {
+ 					Snap(strand, 1, settings.dripFadeTime);
+ 				}
+ 			} else if (pair == _pairs.end()) {
+--- a/src/StrandManager.h
++++ b/src/StrandManager.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "Anatomy.h"
++#include "AmbientLease.h"
+ #include "Body.h"
+ #include "GeometryMath.h"
+ 
+@@ -15,8 +16,9 @@
+ 		void ClearThread(std::int32_t a_thread);
+ 		void Recalibrate();
+ 
++		void RequestAmbient(float interval);
+ 		void Reset();
+-		void Update(float a_delta);
++		void Update(float a_delta, float a_realDelta);
+ 
+ 		static constexpr std::size_t kBones = 10;
+ 
+@@ -140,6 +142,7 @@
+ 			int                                 breakAt{ -1 };
+ 			std::uint32_t                       serial{ 0 };
+ 			bool                                active{ false };
++			bool                                external{ false };
+ 		};
+ 
+ 		struct Glint
+@@ -193,9 +196,11 @@
+ 		void        SpawnCrotch(PairState& a_state);
+ 		void        SpawnSurface(PairState& a_state, const SurfaceSettings& a_surface);
+ 		void        SpawnDrip(PairState& a_state, Source a_source);
+-		void        SpawnDripAt(const Pair& a_pair, Source a_source, RE::NiAVObject* a_root, const std::vector<Point>& a_points);
++		void        SpawnDripAt(const Pair& a_pair, Source a_source, RE::NiAVObject* a_root, const std::vector<Point>& a_points, bool a_external = false);
+ 		void        BeginLinger(const PairState& a_state);
+ 		void        TickLinger(float a_delta);
++		void        TickAmbient(float a_delta);
++		void        ClearAmbientStrands();
+ 		void        StartBetween(Strand& a_strand, Kind a_kind, const PairState& a_state, End a_top, End a_bottom, float a_radius);
+ 		void        Attach(Strand& a_strand, RE::NiAVObject* a_parent);
+ 		void        Snap(Strand& a_strand, int a_segment, float a_fadeTime);
+@@ -214,6 +219,8 @@
+ 		std::map<std::int32_t, std::vector<Pair>> _threads;
+ 		bool                                      _dirty{ false };
+ 
++		AmbientLease _ambient;
++		bool _ambientEligible{ false };
+ 		std::vector<PairState>    _pairs;
+ 		std::vector<Linger>       _lingering;
+ 		std::vector<Strand>       _strands;
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1,4 +1,5 @@
+ #include "Body.h"
++#include "ExternalDrips.h"
+ #include "FluidManager.h"
+ #include "Hooks.h"
+ #include "OCumBridge.h"
+@@ -58,11 +59,13 @@
+ 			OStrands::OStimBridge::Connect();
+ 			break;
+ 		case SKSE::MessagingInterface::kDataLoaded:
++			OStrands::ExternalDrips::Connect();
+ 			OStrands::OCumBridge::Connect();
+ 			OStrands::SexLabBridge::Connect();
+ 			break;
+ 		case SKSE::MessagingInterface::kPreLoadGame:
+ 		case SKSE::MessagingInterface::kNewGame:
++			OStrands::ExternalDrips::Reset();
+ 			OStrands::StrandManager::Get().Reset();
+ 			OStrands::FluidManager::Get().Reset();
+ 			OStrands::Body::Reset();
